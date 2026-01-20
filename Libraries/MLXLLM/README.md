@@ -55,6 +55,7 @@ Currently supported model types are:
 - PhiMoE
 - Qwen2
 - Qwen3
+- Qwen3-Next
 - Starcoder2
 - MiMo
 - GLM4
