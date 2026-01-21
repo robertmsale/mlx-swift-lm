@@ -44,14 +44,6 @@ public enum WiredMemoryLimit: Sendable, Equatable {
             return try await body()
         }
 
-        #if os(macOS) || os(iOS) || os(tvOS)
-            if #available(macOS 15, iOS 18, tvOS 18, *) {
-                return try await Memory.withWiredLimit(limit, body)
-            } else {
-                return try await body()
-            }
-        #else
-            return try await body()
-        #endif
+        return try await Memory.withWiredLimit(limit, body)
     }
 }
