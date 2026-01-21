@@ -1,4 +1,4 @@
-// Port of MiniCPM model configuration to MLX Swift
+// Port of https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/models/minicpm.py
 
 import Foundation
 import MLX
