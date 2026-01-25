@@ -796,6 +796,8 @@ public func generate(
 ///   - wiredMemory: Optional wired memory policy. This is opt-in and only applied on GPU devices
 ///     that support wired memory control (macOS 15 / iOS 18 / tvOS 18 or newer). Defaults to
 ///     ``WiredMemoryLimit/default``.
+///   - wiredMemoryTicket: Optional wired memory ticket for policy-based coordination across
+///     concurrent tasks. When provided, this takes precedence over ``wiredMemory``.
 /// - Returns: An `AsyncStream` that emits `Generation` values, including generated text chunks (`.chunk`),
 ///   tool calls (`.toolCall`), and completion information (`.info`).
 /// - Throws: An error if the `TokenIterator` initialization fails due to invalid input or model configuration.
@@ -826,7 +828,8 @@ public func generate(
 /// ```
 public func generate(
     input: LMInput, cache: [KVCache]? = nil, parameters: GenerateParameters, context: ModelContext,
-    wiredMemory: WiredMemoryLimit = .default
+    wiredMemory: WiredMemoryLimit = .default,
+    wiredMemoryTicket: WiredMemoryTicket? = nil
 ) throws -> AsyncStream<Generation> {
     let iterator = try TokenIterator(
         input: input, model: context.model, cache: cache, parameters: parameters)
@@ -835,7 +838,8 @@ public func generate(
         modelConfiguration: context.configuration,
         tokenizer: context.tokenizer,
         iterator: iterator,
-        wiredMemory: wiredMemory)
+        wiredMemory: wiredMemory,
+        wiredMemoryTicket: wiredMemoryTicket)
     return stream
 }
 
@@ -845,14 +849,16 @@ public func generate(
 )
 public func generate(
     input: LMInput, context: ModelContext,
-    iterator: TokenIterator, wiredMemory: WiredMemoryLimit = .default
+    iterator: TokenIterator, wiredMemory: WiredMemoryLimit = .default,
+    wiredMemoryTicket: WiredMemoryTicket? = nil
 ) -> AsyncStream<Generation> {
     let (stream, _) = generateTask(
         promptTokenCount: input.text.tokens.size,
         modelConfiguration: context.configuration,
         tokenizer: context.tokenizer,
         iterator: iterator,
-        wiredMemory: wiredMemory)
+        wiredMemory: wiredMemory,
+        wiredMemoryTicket: wiredMemoryTicket)
     return stream
 }
 
@@ -867,13 +873,16 @@ public func generate(
 ///   - promptTokenCount: number of tokens in the prompt
 ///   - context: model context (model and tokenizer)
 ///   - iterator: token iterator
+///   - wiredMemory: Optional wired memory policy. Defaults to ``WiredMemoryLimit/default``.
+///   - wiredMemoryTicket: Optional wired memory ticket for policy-based coordination.
 /// - Returns: An `AsyncStream` that emits `Generation` values and a `Task`
 public func generateTask(
     promptTokenCount: Int,
     modelConfiguration: ModelConfiguration,
     tokenizer: Tokenizer,
     iterator: consuming TokenIterator,
-    wiredMemory: WiredMemoryLimit = .default
+    wiredMemory: WiredMemoryLimit = .default,
+    wiredMemoryTicket: WiredMemoryTicket? = nil
 ) -> (AsyncStream<Generation>, Task<Void, Never>) {
 
     let (stream, continuation) = AsyncStream<Generation>.makeStream()
@@ -882,7 +891,7 @@ public func generateTask(
 
     // Launch a Task to perform iteration asynchronously.
     let task = Task {
-        wiredMemory.withWiredMemory {
+        let performIteration = {
             let iterator = iterator.consume()
 
             var start = Date.timeIntervalSinceReferenceDate
@@ -954,6 +963,16 @@ public func generateTask(
 
             // Finalize the stream
             continuation.finish()
+        }
+
+        if let ticket = wiredMemoryTicket {
+            await WiredMemoryTicket.withWiredLimit(ticket) {
+                performIteration()
+            }
+        } else {
+            await wiredMemory.withWiredMemory { () async -> Void in
+                performIteration()
+            }
         }
     }
 
