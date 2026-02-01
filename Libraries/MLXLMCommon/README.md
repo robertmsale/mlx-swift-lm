@@ -153,6 +153,8 @@ Use the policy-based API to coordinate a single global wired limit across tasks.
 This is opt-in and only applies on GPU devices that support wired memory control
 (macOS 15 / iOS 18 / tvOS 18 or newer). On unsupported platforms or devices it is
 silently ignored.
+`WiredMemoryManager` and `WiredMemoryTicket` are provided by MLX, while
+LLM-oriented policies (like `WiredSumPolicy`) live in MLXLMCommon.
 
 ```swift
 let policy = WiredSumPolicy()
@@ -168,6 +170,11 @@ let stream = try MLXLMCommon.generate(
 
 Tickets are cheap handles into a shared manager that serializes updates and
 restores the baseline when the last ticket completes.
+
+For long-lived model weights, consider using a reservation ticket by passing
+`kind: .reservation` when creating the ticket. Reservation tickets influence
+admission and desired limits but do not keep the wired limit elevated unless
+there is at least one active (inference) ticket.
 
 #### Policies and Tickets
 

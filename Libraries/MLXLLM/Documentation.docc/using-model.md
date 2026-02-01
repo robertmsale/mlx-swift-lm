@@ -125,6 +125,8 @@ Use the policy-based API to coordinate a single global wired limit across tasks.
 This is opt-in and only applies on GPU devices that support wired memory control
 (macOS 15 / iOS 18 / tvOS 18 or newer). On unsupported platforms or devices it is
 silently ignored.
+`WiredMemoryManager` and `WiredMemoryTicket` are provided by MLX, while
+LLM-specific policies (like `WiredSumPolicy`) live in MLXLMCommon.
 
 ```swift
 let policy = WiredSumPolicy()
@@ -146,3 +148,7 @@ Policies can also gate concurrency by implementing `canAdmit`. When admission is
 denied, `start()` suspends until capacity is available. For debugging, the
 `WiredMemoryManager.events()` stream emits changes in DEBUG builds and is a no-op
 in release builds.
+
+If you want to account for long-lived model weights without keeping the wired
+limit elevated while idle, create tickets with `kind: .reservation` so they
+participate in admission and limit calculation only when active tickets exist.

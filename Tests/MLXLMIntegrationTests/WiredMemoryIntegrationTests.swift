@@ -18,6 +18,35 @@ final class WiredMemoryIntegrationTests: XCTestCase {
         }
     }
 
+    /// Allows only a single active ticket at a time.
+    struct SingleActivePolicy: WiredMemoryPolicy, Hashable, Sendable {
+        func limit(baseline: Int, activeSizes: [Int]) -> Int {
+            baseline + activeSizes.reduce(0, +)
+        }
+
+        func canAdmit(baseline: Int, activeSizes: [Int], newSize: Int) -> Bool {
+            activeSizes.isEmpty
+        }
+    }
+
+    /// Models policies that share a common weight budget without double counting it.
+    struct SharedWeightsPolicy: WiredMemoryPolicy, Hashable, Sendable {
+        let name: String
+        let sharedBytes: Int
+
+        func limit(baseline: Int, activeSizes: [Int]) -> Int {
+            baseline + sharedBytes + activeSizes.reduce(0, +)
+        }
+
+        func canAdmit(baseline: Int, activeSizes: [Int], newSize: Int) -> Bool {
+            // Admission uses the shared weight budget so each policy stays within
+            // its own view of total demand.
+            let projected = sharedBytes + activeSizes.reduce(0, +) + max(0, newSize)
+            return projected >= 0
+        }
+    }
+
+    /// Verifies that the default, no-ticket path still supports concurrent inference.
     func testConcurrentInferencesDefaultWiredMemory() async throws {
         let container = try await IntegrationTestModels.shared.llmContainer()
         let parameters = GenerateParameters(maxTokens: 16)
@@ -160,6 +189,201 @@ final class WiredMemoryIntegrationTests: XCTestCase {
         XCTAssertTrue(sawTwoPoliciesActive, "Expected tickets from two policies to overlap.")
     }
 
+    /// Verifies that passing a wired memory ticket to inference results in
+    /// ticket lifecycle events and limit updates.
+    func testGenerateEmitsTicketLifecycleEvents() async throws {
+        guard Device.defaultDevice().deviceType == .gpu else {
+            throw XCTSkip("Wired memory control only available on GPU devices.")
+        }
+
+        let container = try await IntegrationTestModels.shared.llmContainer()
+        let parameters = GenerateParameters(maxTokens: 8)
+        let prompt = "Write one short sentence about the ocean."
+
+        let manager = WiredMemoryManager()
+        let policy = WiredSumPolicy()
+        let ticket = WiredMemoryTicket(
+            size: 64 * 1024 * 1024,
+            policy: policy,
+            manager: manager,
+            kind: .active
+        )
+
+        let stream = await manager.events()
+        async let collectedEvents = Self.collectEvents(stream: stream) { event in
+            event.kind == .baselineRestored && event.activeCount == 0
+        }
+
+        let input = UserInput(prompt: prompt)
+        let prepared = try await container.prepare(input: input)
+        let genStream = try await container.generate(
+            input: prepared,
+            parameters: parameters,
+            wiredMemoryTicket: ticket
+        )
+
+        for await _ in genStream {}
+
+        let events = try await collectedEvents
+        guard !events.isEmpty else {
+            throw XCTSkip("Wired memory events not available in this build.")
+        }
+
+        if events.contains(where: { $0.kind == .limitApplyFailed }) {
+            throw XCTSkip("Wired limit updates failed on this device.")
+        }
+
+        let sawStart = events.contains { $0.kind == .ticketStarted && $0.ticketID == ticket.id }
+        let sawEnd = events.contains { $0.kind == .ticketEnded && $0.ticketID == ticket.id }
+        XCTAssertTrue(sawStart, "Expected ticket to start during inference.")
+        XCTAssertTrue(sawEnd, "Expected ticket to end after inference completes.")
+    }
+
+    /// Ensures admission control can serialize inference when a policy denies
+    /// concurrent tickets.
+    func testAdmissionGatingSerializesInference() async throws {
+        guard Device.defaultDevice().deviceType == .gpu else {
+            throw XCTSkip("Wired memory control only available on GPU devices.")
+        }
+
+        let container = try await IntegrationTestModels.shared.llmContainer()
+        let parameters = GenerateParameters(maxTokens: 32)
+        let prompt = "Explain why tests exist in one sentence."
+
+        let manager = WiredMemoryManager()
+        let policy = SingleActivePolicy()
+
+        let ticketA = WiredMemoryTicket(
+            id: UUID(),
+            size: 64 * 1024 * 1024,
+            policy: policy,
+            manager: manager,
+            kind: .active
+        )
+        let ticketB = WiredMemoryTicket(
+            id: UUID(),
+            size: 64 * 1024 * 1024,
+            policy: policy,
+            manager: manager,
+            kind: .active
+        )
+
+        let stream = await manager.events()
+        let gateStream = await manager.events()
+
+        async let collectedEvents = Self.collectEvents(stream: stream) { event in
+            event.kind == .baselineRestored && event.activeCount == 0
+        }
+
+        let runInference: (WiredMemoryTicket) async throws -> Void = { ticket in
+            let input = UserInput(prompt: prompt)
+            let prepared = try await container.prepare(input: input)
+            let genStream = try await container.generate(
+                input: prepared,
+                parameters: parameters,
+                wiredMemoryTicket: ticket
+            )
+            for await _ in genStream {}
+        }
+
+        async let first = runInference(ticketA)
+
+        // Wait until the first ticket becomes active before launching the second.
+        _ = try await Self.collectEvents(stream: gateStream) { event in
+            event.kind == .ticketStarted && event.ticketID == ticketA.id
+        }
+        try await Task.sleep(nanoseconds: 50_000_000)
+
+        async let second = runInference(ticketB)
+
+        _ = try await (first, second)
+
+        let events = try await collectedEvents
+        guard !events.isEmpty else {
+            throw XCTSkip("Wired memory events not available in this build.")
+        }
+
+        if events.contains(where: { $0.kind == .limitApplyFailed }) {
+            throw XCTSkip("Wired limit updates failed on this device.")
+        }
+
+        let sawAdmissionWait = events.contains {
+            $0.kind == .admissionWait && $0.ticketID == ticketB.id
+        }
+        XCTAssertTrue(sawAdmissionWait, "Expected second ticket to wait for admission.")
+    }
+
+    /// Demonstrates shared embedding weights across two policies without double counting.
+    func testSharedWeightsAcrossPoliciesUsesMaxNotSum() async throws {
+        guard Device.defaultDevice().deviceType == .gpu else {
+            throw XCTSkip("Wired memory control only available on GPU devices.")
+        }
+
+        let maxBytes = GPU.deviceInfo().maxRecommendedWorkingSetSize
+        guard maxBytes > 0 else {
+            throw XCTSkip("No recommended working set size available.")
+        }
+
+        let manager = WiredMemoryManager()
+        let mib = 1024 * 1024
+        let sharedWeights = 256 * mib
+
+        let embeddingPolicy = SharedWeightsPolicy(name: "embedding", sharedBytes: sharedWeights)
+        let chatPolicy = SharedWeightsPolicy(name: "chat", sharedBytes: sharedWeights)
+
+        let embedTicket = WiredMemoryTicket(
+            size: 64 * mib,
+            policy: embeddingPolicy,
+            manager: manager,
+            kind: .active
+        )
+        let chatTicket = WiredMemoryTicket(
+            size: 192 * mib,
+            policy: chatPolicy,
+            manager: manager,
+            kind: .active
+        )
+
+        let stream = await manager.events()
+        async let collectedEvents = Self.collectEvents(stream: stream) { event in
+            event.kind == .baselineRestored && event.activeCount == 0
+        }
+
+        _ = await embedTicket.start()
+        _ = await chatTicket.start()
+        _ = await chatTicket.end()
+        _ = await embedTicket.end()
+
+        let events = try await collectedEvents
+        guard !events.isEmpty else {
+            throw XCTSkip("Wired memory events not available in this build.")
+        }
+
+        if events.contains(where: { $0.kind == .limitApplyFailed }) {
+            throw XCTSkip("Wired limit updates failed on this device.")
+        }
+
+        guard let baseline = events.first(where: { $0.kind == .baselineCaptured })?.baseline else {
+            throw TestError.missingBaseline
+        }
+
+        // Each policy includes the shared weights; the manager selects the max.
+        let embedLimit = baseline + sharedWeights + (64 * mib)
+        let chatLimit = baseline + sharedWeights + (192 * mib)
+        let summedLimit = baseline + sharedWeights + (64 * mib) + (192 * mib)
+
+        let sawEmbed = events.contains { $0.kind == .limitApplied && $0.appliedLimit == embedLimit }
+        let sawChat = events.contains { $0.kind == .limitApplied && $0.appliedLimit == chatLimit }
+        let sawSummed = events.contains {
+            $0.kind == .limitApplied && $0.appliedLimit == summedLimit
+        }
+
+        XCTAssertTrue(sawEmbed, "Expected embedding policy limit to be applied.")
+        XCTAssertTrue(sawChat, "Expected chat policy limit to be applied.")
+        XCTAssertFalse(sawSummed, "Expected shared weights not to be double counted.")
+    }
+
+    /// Collects events until the predicate matches or a timeout fires.
     private static func collectEvents(
         stream: AsyncStream<WiredMemoryEvent>,
         until predicate: @Sendable @escaping (WiredMemoryEvent) -> Bool,

@@ -4,6 +4,11 @@ import Foundation
 import MLX
 import Tokenizers
 
+private func withOptionalWiredLimitSync<R>(_ limit: Int?, _ body: () -> R) -> R {
+    guard let limit else { return body() }
+    return Memory.withWiredLimit(limit, body)
+}
+
 /// A `LogitSampler` is responsible for sampling `logits` produced by
 /// a ``LanguageModel`` to produce a token.
 ///
@@ -537,6 +542,9 @@ public enum GenerateDisposition: Sendable {
 ///   - model: model to evaluate
 ///   - tokenizer: tokenizer to convert tokens back into strings and recognize special tokens
 ///   - extraEOSTokens: any additional stop tokens
+///   - wiredMemoryLimit: Optional wired limit (bytes) applied for the duration of
+///     this synchronous call. Use `GPU.maxRecommendedWorkingSetBytes()` if you want
+///     to clamp to Metal's recommended working set size.
 ///   - didGenerate: visitor for the tokens as they are generated
 @available(
     *, deprecated,
@@ -547,6 +555,7 @@ public func generate(
     promptTokens: [Int], parameters: GenerateParameters, model: any LanguageModel,
     tokenizer: Tokenizer,
     extraEOSTokens: Set<String>? = nil,
+    wiredMemoryLimit: Int? = nil,
     didGenerate: ([Int]) -> GenerateDisposition
 ) throws -> GenerateResult {
     let tokens = MLXArray(promptTokens)
@@ -563,6 +572,7 @@ public func generate(
 
     return generate(
         input: input, context: context, iterator: iterator,
+        wiredMemoryLimit: wiredMemoryLimit,
         didGenerate: didGenerate)
 }
 
@@ -574,6 +584,9 @@ public func generate(
 ///   - input: prepared language model input
 ///   - parameters: parameters controlling the token generation
 ///   - context: model context (model and tokenizer)
+///   - wiredMemoryLimit: Optional wired limit (bytes) applied for the duration of
+///     this synchronous call. Use `GPU.maxRecommendedWorkingSetBytes()` if you want
+///     to clamp to Metal's recommended working set size.
 ///   - didGenerate: token visitor that can output tokens as they are generated and indicate early stop
 /// - Returns: the generated output
 @available(
@@ -583,12 +596,14 @@ public func generate(
 )
 public func generate(
     input: LMInput, parameters: GenerateParameters, context: ModelContext,
+    wiredMemoryLimit: Int? = nil,
     didGenerate: ([Int]) -> GenerateDisposition
 ) throws -> GenerateResult {
     let iterator = try TokenIterator(
         input: input, model: context.model, parameters: parameters)
     return generate(
         input: input, context: context, iterator: iterator,
+        wiredMemoryLimit: wiredMemoryLimit,
         didGenerate: didGenerate)
 }
 
@@ -600,6 +615,9 @@ public func generate(
 ///   - input: prepared language model input
 ///   - context: model context (model and tokenizer)
 ///   - iterator: token iterator
+///   - wiredMemoryLimit: Optional wired limit (bytes) applied for the duration of
+///     this synchronous call. Use `GPU.maxRecommendedWorkingSetBytes()` if you want
+///     to clamp to Metal's recommended working set size.
 ///   - didGenerate: token visitor that can output tokens as they are generated and indicate early stop
 /// - Returns: the generated output
 @available(
@@ -610,57 +628,60 @@ public func generate(
 public func generate(
     input: LMInput, context: ModelContext,
     iterator: TokenIterator,
+    wiredMemoryLimit: Int? = nil,
     didGenerate: ([Int]) -> GenerateDisposition
 ) -> GenerateResult {
-    var start = Date.timeIntervalSinceReferenceDate
-    var promptTime: TimeInterval = 0
+    return withOptionalWiredLimitSync(wiredMemoryLimit) {
+        var start = Date.timeIntervalSinceReferenceDate
+        var promptTime: TimeInterval = 0
 
-    // Build complete EOS token set from all sources
-    var eosTokenIds = context.configuration.eosTokenIds
-    if let tokenizerEos = context.tokenizer.eosTokenId {
-        eosTokenIds.insert(tokenizerEos)
+        // Build complete EOS token set from all sources
+        var eosTokenIds = context.configuration.eosTokenIds
+        if let tokenizerEos = context.tokenizer.eosTokenId {
+            eosTokenIds.insert(tokenizerEos)
+        }
+        for token in context.configuration.extraEOSTokens {
+            if let id = context.tokenizer.convertTokenToId(token) {
+                eosTokenIds.insert(id)
+            }
+        }
+
+        var tokens = [Int]()
+
+        for token in iterator {
+            // compute the timing for the prompt
+            if tokens.isEmpty {
+                let now = Date.timeIntervalSinceReferenceDate
+                promptTime = now - start
+                start = now
+            }
+
+            if token == context.tokenizer.unknownTokenId || eosTokenIds.contains(token) {
+                break
+            }
+            tokens.append(token)
+
+            if didGenerate(tokens) == .stop {
+                break
+            }
+        }
+
+        let now = Date.timeIntervalSinceReferenceDate
+        let generateTime = now - start
+
+        // TokenIterator uses `asyncEval()` to keep the pipeline full. If the caller
+        // exits the program right away, those tasks will still be executing and will
+        // hit assertions as the mlx scheduler is torn down. Synchronize with the stream
+        // to make sure it is complete.
+        Stream().synchronize()
+
+        return GenerateResult(
+            inputText: input.text, tokens: tokens,
+            output: context.tokenizer.decode(tokens: tokens),
+            promptTime: promptTime + iterator.promptPrefillTime,
+            generateTime: generateTime
+        )
     }
-    for token in context.configuration.extraEOSTokens {
-        if let id = context.tokenizer.convertTokenToId(token) {
-            eosTokenIds.insert(id)
-        }
-    }
-
-    var tokens = [Int]()
-
-    for token in iterator {
-        // compute the timing for the prompt
-        if tokens.isEmpty {
-            let now = Date.timeIntervalSinceReferenceDate
-            promptTime = now - start
-            start = now
-        }
-
-        if token == context.tokenizer.unknownTokenId || eosTokenIds.contains(token) {
-            break
-        }
-        tokens.append(token)
-
-        if didGenerate(tokens) == .stop {
-            break
-        }
-    }
-
-    let now = Date.timeIntervalSinceReferenceDate
-    let generateTime = now - start
-
-    // TokenIterator uses `asyncEval()` to keep the pipeline full. If the caller
-    // exits the program right away, those tasks will still be executing and will
-    // hit assertions as the mlx scheduler is torn down. Synchronize with the stream
-    // to make sure it is complete.
-    Stream().synchronize()
-
-    return GenerateResult(
-        inputText: input.text, tokens: tokens,
-        output: context.tokenizer.decode(tokens: tokens),
-        promptTime: promptTime + iterator.promptPrefillTime,
-        generateTime: generateTime
-    )
 }
 
 /// Generate tokens from an ``LMInput`` and a ``ModelContext``.
@@ -671,6 +692,9 @@ public func generate(
 ///   - input: prepared language model input
 ///   - parameters: parameters controlling the token generation
 ///   - context: model context (model and tokenizer)
+///   - wiredMemoryLimit: Optional wired limit (bytes) applied for the duration of
+///     this synchronous call. Use `GPU.maxRecommendedWorkingSetBytes()` if you want
+///     to clamp to Metal's recommended working set size.
 ///   - didGenerate: token visitor that can output tokens as they are generated and indicate early stop
 /// - Returns: Information about the generation
 @available(
@@ -680,12 +704,14 @@ public func generate(
 )
 public func generate(
     input: LMInput, parameters: GenerateParameters, context: ModelContext,
+    wiredMemoryLimit: Int? = nil,
     didGenerate: (Int) -> GenerateDisposition
 ) throws -> GenerateCompletionInfo {
     let iterator = try TokenIterator(
         input: input, model: context.model, parameters: parameters)
     return generate(
         input: input, context: context, iterator: iterator,
+        wiredMemoryLimit: wiredMemoryLimit,
         didGenerate: didGenerate)
 }
 
@@ -697,6 +723,9 @@ public func generate(
 ///   - input: prepared language model input
 ///   - context: model context (model and tokenizer)
 ///   - iterator: token iterator
+///   - wiredMemoryLimit: Optional wired limit (bytes) applied for the duration of
+///     this synchronous call. Use `GPU.maxRecommendedWorkingSetBytes()` if you want
+///     to clamp to Metal's recommended working set size.
 ///   - didGenerate: token visitor that can output tokens as they are generated and indicate early stop
 /// - Returns: Information about the generation
 @available(
@@ -707,57 +736,60 @@ public func generate(
 public func generate(
     input: LMInput, context: ModelContext,
     iterator: TokenIterator,
+    wiredMemoryLimit: Int? = nil,
     didGenerate: (Int) -> GenerateDisposition
 ) -> GenerateCompletionInfo {
-    var start = Date.timeIntervalSinceReferenceDate
-    var promptTime: TimeInterval = 0
+    return withOptionalWiredLimitSync(wiredMemoryLimit) {
+        var start = Date.timeIntervalSinceReferenceDate
+        var promptTime: TimeInterval = 0
 
-    // Build complete EOS token set from all sources
-    var eosTokenIds = context.configuration.eosTokenIds
-    if let tokenizerEos = context.tokenizer.eosTokenId {
-        eosTokenIds.insert(tokenizerEos)
+        // Build complete EOS token set from all sources
+        var eosTokenIds = context.configuration.eosTokenIds
+        if let tokenizerEos = context.tokenizer.eosTokenId {
+            eosTokenIds.insert(tokenizerEos)
+        }
+        for token in context.configuration.extraEOSTokens {
+            if let id = context.tokenizer.convertTokenToId(token) {
+                eosTokenIds.insert(id)
+            }
+        }
+
+        var tokenCount = 0
+
+        for token in iterator {
+            // Compute the timing for the prompt
+            if promptTime == 0 {
+                let now = Date.timeIntervalSinceReferenceDate
+                promptTime = now - start
+                start = now
+            }
+
+            // Check for end-of-sequence tokens
+            if token == context.tokenizer.unknownTokenId || eosTokenIds.contains(token) {
+                break
+            }
+
+            tokenCount += 1
+
+            // Invoke the callback with the current token
+            if didGenerate(token) == .stop {
+                break
+            }
+        }
+
+        let now = Date.timeIntervalSinceReferenceDate
+        let generateTime = now - start
+
+        // Synchronize with the stream to ensure tasks are completed
+        Stream().synchronize()
+
+        return GenerateCompletionInfo(
+            promptTokenCount: input.text.tokens.size,
+            generationTokenCount: tokenCount,
+            promptTime: promptTime + iterator.promptPrefillTime,
+            generationTime: generateTime
+        )
     }
-    for token in context.configuration.extraEOSTokens {
-        if let id = context.tokenizer.convertTokenToId(token) {
-            eosTokenIds.insert(id)
-        }
-    }
-
-    var tokenCount = 0
-
-    for token in iterator {
-        // Compute the timing for the prompt
-        if promptTime == 0 {
-            let now = Date.timeIntervalSinceReferenceDate
-            promptTime = now - start
-            start = now
-        }
-
-        // Check for end-of-sequence tokens
-        if token == context.tokenizer.unknownTokenId || eosTokenIds.contains(token) {
-            break
-        }
-
-        tokenCount += 1
-
-        // Invoke the callback with the current token
-        if didGenerate(token) == .stop {
-            break
-        }
-    }
-
-    let now = Date.timeIntervalSinceReferenceDate
-    let generateTime = now - start
-
-    // Synchronize with the stream to ensure tasks are completed
-    Stream().synchronize()
-
-    return GenerateCompletionInfo(
-        promptTokenCount: input.text.tokens.size,
-        generationTokenCount: tokenCount,
-        promptTime: promptTime + iterator.promptPrefillTime,
-        generationTime: generateTime
-    )
 }
 
 /// Generates tokens asynchronously using the provided language model input, parameters, and context.
